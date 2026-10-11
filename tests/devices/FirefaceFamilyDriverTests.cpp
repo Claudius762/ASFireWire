@@ -248,10 +248,15 @@ TEST(FirefaceSequenceTests, FF800UsesActualReservedPlaybackAndDeviceSelectedCapt
     auto assigned = family.AssignChannels(channels);
     ASSERT_TRUE(assigned);
     EXPECT_EQ(assigned->deviceToHostIsoChannel, 6);
-    ASSERT_EQ(bus.writes.size(), 1U); // init only: the fetch mask stays closed until Confirm
+    // The frequency lands first and alone, then the packet format and the size
+    // of the stream the card transmits (WaitForConfigured48k). No fetch mask yet.
+    ASSERT_EQ(bus.writes.size(), 2U);
     EXPECT_EQ(bus.writes[0].hi, 2U);
     EXPECT_EQ(bus.writes[0].lo, 0x1cU);
-    EXPECT_EQ(bus.writes[0].bytes, (std::vector<uint8_t>{0x80,0xbb,0,0, 3,0xe0,0,0, 0x1c,0x08,0,0}));
+    EXPECT_EQ(bus.writes[0].bytes, (std::vector<uint8_t>{0x80,0xbb,0,0}));
+    EXPECT_EQ(bus.writes[1].hi, 2U);
+    EXPECT_EQ(bus.writes[1].lo, 0x20U);
+    EXPECT_EQ(bus.writes[1].bytes, (std::vector<uint8_t>{3,0xe0,0,0, 0x1c,0x08,0,0}));
     ASSERT_TRUE(family.ArmDeviceTxAndEnable());
     EXPECT_EQ(bus.writes.back().lo, 0x28U);
     EXPECT_EQ(bus.writes.back().bytes, (std::vector<uint8_t>{0x1c,0x08,0,0x80}));
@@ -260,12 +265,12 @@ TEST(FirefaceSequenceTests, FF800UsesActualReservedPlaybackAndDeviceSelectedCapt
     EXPECT_EQ(bus.writes.back().lo, 0x801c0000U);
     EXPECT_EQ(bus.writes.back().bytes, std::vector<uint8_t>(28U * 4U, 0)); // fetch every channel
     EXPECT_EQ(family.Stop(), kIOReturnSuccess);
-    ASSERT_EQ(bus.writes.size(), 5U); // init, start, fetch, stop, mute; no mixer or clock-source writes
-    EXPECT_EQ(bus.writes[3].hi, 2U);
-    EXPECT_EQ(bus.writes[3].lo, 0x34U);
-    EXPECT_EQ(bus.writes[3].bytes, (std::vector<uint8_t>{0,0,0,0, 0,0,0,0, 0,0,0,0}));
-    EXPECT_EQ(bus.writes[4].lo, 0x801c0000U);
-    EXPECT_EQ(bus.writes[4].bytes, MuteMask(28U)); // stop first, then mute
+    ASSERT_EQ(bus.writes.size(), 6U); // init (2), start, fetch, stop, mute; no mixer or clock-source writes
+    EXPECT_EQ(bus.writes[4].hi, 2U);
+    EXPECT_EQ(bus.writes[4].lo, 0x34U);
+    EXPECT_EQ(bus.writes[4].bytes, (std::vector<uint8_t>{0,0,0,0, 0,0,0,0, 0,0,0,0}));
+    EXPECT_EQ(bus.writes[5].lo, 0x801c0000U);
+    EXPECT_EQ(bus.writes[5].bytes, MuteMask(28U)); // stop first, then mute
 }
 
 TEST(FirefaceSequenceTests, FF800S400TupleDoesNotSetTheS800Flag) {
@@ -277,7 +282,154 @@ TEST(FirefaceSequenceTests, FF800S400TupleDoesNotSetTheS800Flag) {
     ASSERT_TRUE(family.AssignChannels(channels));
     EXPECT_EQ(bus.writes[0].hi, 0x0002U);
     EXPECT_EQ(bus.writes[0].lo, 0x1cU);
-    EXPECT_EQ(bus.writes[0].bytes, (std::vector<uint8_t>{0x80,0xbb,0,0, 1,0xe0,0,0, 28,0,0,0}));
+    EXPECT_EQ(bus.writes[0].bytes, (std::vector<uint8_t>{0x80,0xbb,0,0}));
+    EXPECT_EQ(bus.writes[1].lo, 0x20U);
+    EXPECT_EQ(bus.writes[1].bytes, (std::vector<uint8_t>{1,0xe0,0,0, 28,0,0,0}));
+}
+
+TEST(FirefaceSequenceTests, FF800GetsTheFrequencyBeforeThePacketFormatItNeverElseAccepted) {
+    // Field log 2026-10-11: this card stores 44.1 kHz, and with the frequency,
+    // the packet format and the transmit-stream size in one 3-quadlet block
+    // (FFADO's order) it answered 0xffffffff at 0x801c0008 for the whole 500 ms
+    // deadline on seven consecutive starts. Linux writes the frequency alone
+    // first -- "if starting isochronous communication immediately, change of STF
+    // has no effect ... let's sleep for a bit" (ff800_allocate_resources) -- and
+    // the card then publishes its channel. This is that replay.
+    FirefaceScriptBus bus;
+    bus.status0 = 0x01c000b0U; bus.status1 = 0x80001201U;  // internal, 44.1 kHz, as our field log reads it
+    bus.captureWord = 0xffffffffU; bus.status3 = 0xffffffffU;
+    bool at48kWhenTheFormatLanded = false;
+    bus.writeHook = [&bus, &at48kWhenTheFormatLanded](uint64_t key) {
+        if (key == 0x00020000001cULL) {  // the frequency lands: the card is at 48 kHz now
+            bus.status0 = 0x01c000c0U; bus.status1 = 0xa0001207U;
+        } else if (key == 0x000200000020ULL) {  // the format lands: the card picks its channel
+            at48kWhenTheFormatLanded = bus.status1 == 0xa0001207U;
+            bus.captureWord = 1;
+        }
+    };
+    RouteState route; ProtocolRegisterIO io(bus, bus, route.registry, route.route);
+    ASFW::Audio::RME::FirefaceFamilyDriver family(io, ASFW::Audio::RME::FirefaceModel::kFF800, false);
+    ASFW::Audio::AudioDuplexChannels channels{};
+    ASSERT_TRUE(family.Configure(channels, {.sampleRateHz = 48000}));
+    const auto assigned = family.AssignChannels(channels);
+    ASSERT_TRUE(assigned) << "a channel published only after the frequency took effect was missed";
+    EXPECT_EQ(assigned->deviceToHostIsoChannel, 1U);
+    EXPECT_TRUE(at48kWhenTheFormatLanded) << "the packet format reached the card while it was still at 44.1 kHz";
+    ASSERT_GE(bus.writes.size(), 2U);
+    EXPECT_EQ(bus.writes[0].lo, 0x1cU);
+    EXPECT_EQ(bus.writes[1].lo, 0x20U);
+}
+
+TEST(FirefaceSequenceTests, FF800FormatWaitsTheSettleEvenWhenTheStatusReports48kFirst) {
+    // Field log 2026-10-12: with the card back at its stored 44.1 kHz, eight
+    // consecutive starts read 48 kHz in the status words about 20 ms after the
+    // frequency write -- and the packet format written at that point never
+    // allocated the transmit stream, so all eight timed out. Linux sleeps a flat
+    // 100 ms for exactly this reason: the status reports the new rate before the
+    // change is in effect. The format must not reach the card inside that window.
+    FirefaceScriptBus bus;
+    bus.status0 = 0x01c000b0U; bus.status1 = 0x80001201U;  // internal, 44.1 kHz
+    bus.captureWord = 0xffffffffU; bus.status3 = 0xffffffffU;
+    uint64_t frequencyWrittenAtMs = 0;
+    uint64_t formatWrittenAtMs = 0;
+    bus.writeHook = [&bus, &frequencyWrittenAtMs, &formatWrittenAtMs](uint64_t key) {
+        if (key == 0x00020000001cULL) {  // the frequency lands
+            frequencyWrittenAtMs = ASFW::Audio::Session::UptimeMilliseconds();
+            // The card answers 48 kHz at once; the change is not in effect yet.
+            bus.status0 = 0x01c000c0U; bus.status1 = 0xa0001207U;
+        } else if (key == 0x000200000020ULL) {  // the format lands
+            formatWrittenAtMs = ASFW::Audio::Session::UptimeMilliseconds();
+            bus.captureWord = 1;
+        }
+    };
+    RouteState route; ProtocolRegisterIO io(bus, bus, route.registry, route.route);
+    ASFW::Audio::RME::FirefaceFamilyDriver family(io, ASFW::Audio::RME::FirefaceModel::kFF800, false);
+    ASFW::Audio::AudioDuplexChannels channels{};
+    ASSERT_TRUE(family.Configure(channels, {.sampleRateHz = 48000}));
+    const auto assigned = family.AssignChannels(channels);
+    ASSERT_TRUE(assigned) << "the card published its channel once the frequency had settled";
+    EXPECT_EQ(assigned->deviceToHostIsoChannel, 1U);
+    EXPECT_EQ(bus.writes[0].lo, 0x1cU);
+    EXPECT_EQ(bus.writes[1].lo, 0x20U);
+    ASSERT_NE(formatWrittenAtMs, 0U) << "the packet format never reached the card";
+    EXPECT_GE(formatWrittenAtMs - frequencyWrittenAtMs,
+              ASFW::Audio::RME::Register::kFF800RateSettleMs)
+        << "the packet format reached a card still inside the frequency's settle window";
+}
+
+TEST(FirefaceSequenceTests, FF800FormatWaitsForTheFrequencyItselfWhenItArrivesLate) {
+    // The other half of the same gate: a card that keeps answering 44.1 kHz for
+    // longer than the settle window must still not be handed the packet format
+    // until it reports the new rate. The wait needs both conditions, not either.
+    FirefaceScriptBus bus;
+    bus.status0 = 0x01c000b0U; bus.status1 = 0x80001201U;  // internal, 44.1 kHz
+    bus.captureWord = 0xffffffffU; bus.status3 = 0xffffffffU;
+    uint64_t frequencyWrittenAtMs = 0;
+    uint64_t rateVisibleAtMs = 0;
+    uint64_t formatWrittenAtMs = 0;
+    bus.writeHook = [&bus, &frequencyWrittenAtMs, &formatWrittenAtMs](uint64_t key) {
+        if (key == 0x00020000001cULL) {
+            frequencyWrittenAtMs = ASFW::Audio::Session::UptimeMilliseconds();
+        } else if (key == 0x000200000020ULL) {
+            formatWrittenAtMs = ASFW::Audio::Session::UptimeMilliseconds();
+            bus.captureWord = 1;
+        }
+    };
+    bus.readHook = [&bus, &frequencyWrittenAtMs, &rateVisibleAtMs](uint64_t key) {
+        if (key != 0x801c0000ULL || frequencyWrittenAtMs == 0 || rateVisibleAtMs != 0) return;
+        if (ASFW::Audio::Session::UptimeMilliseconds() - frequencyWrittenAtMs < 120U) return;
+        rateVisibleAtMs = ASFW::Audio::Session::UptimeMilliseconds();
+        bus.status0 = 0x01c000c0U; bus.status1 = 0xa0001207U;  // now at 48 kHz
+    };
+    RouteState route; ProtocolRegisterIO io(bus, bus, route.registry, route.route);
+    ASFW::Audio::RME::FirefaceFamilyDriver family(io, ASFW::Audio::RME::FirefaceModel::kFF800, false);
+    ASFW::Audio::AudioDuplexChannels channels{};
+    ASSERT_TRUE(family.Configure(channels, {.sampleRateHz = 48000}));
+    const auto assigned = family.AssignChannels(channels);
+    ASSERT_TRUE(assigned) << "a card slower than the settle window must still get the format";
+    EXPECT_EQ(assigned->deviceToHostIsoChannel, 1U);
+    ASSERT_NE(rateVisibleAtMs, 0U) << "the card never reported the new rate";
+    ASSERT_NE(formatWrittenAtMs, 0U) << "the packet format never reached the card";
+    EXPECT_GE(formatWrittenAtMs, rateVisibleAtMs)
+        << "the packet format reached a card still at its stored 44.1 kHz";
+    EXPECT_GE(formatWrittenAtMs - frequencyWrittenAtMs,
+              ASFW::Audio::RME::Register::kFF800RateSettleMs);
+}
+
+TEST(FirefaceSequenceTests, FF800ResetsTheDeviceStreamStateAndRetriesWhenNoChannelAppears) {
+    // Field log 2026-10-12: a start that failed on the frequency change left the
+    // card refusing to allocate its transmit stream for every attempt that
+    // followed, with the card back at 48 kHz and writes byte-identical to a
+    // working start. The device's own state is the only difference left, so the
+    // driver clears it the way FFADO does before a start (the end block at
+    // RME_FF800_STREAM_END_REG) and gives the init one more full attempt.
+    FirefaceScriptBus bus;
+    bus.status0 = 0x01c000c0U; bus.status1 = 0xa0001207U;  // internal, 48 kHz
+    bus.captureWord = 0xffffffffU; bus.status3 = 0xffffffffU;
+    int formatWrites = 0;
+    bus.writeHook = [&bus, &formatWrites](uint64_t key) {
+        if (key != 0x000200000020ULL) return;
+        ++formatWrites;
+        if (formatWrites == 2) bus.captureWord = 1;  // only the retry gets a channel
+    };
+    RouteState route; ProtocolRegisterIO io(bus, bus, route.registry, route.route);
+    ASFW::Audio::RME::FirefaceFamilyDriver family(io, ASFW::Audio::RME::FirefaceModel::kFF800, false);
+    ASFW::Audio::AudioDuplexChannels channels{};
+    ASSERT_TRUE(family.Configure(channels, {.sampleRateHz = 48000}));
+    const auto assigned = family.AssignChannels(channels);
+    ASSERT_TRUE(assigned) << "the retry must recover a card that stopped publishing its channel";
+    EXPECT_EQ(assigned->deviceToHostIsoChannel, 1U);
+    EXPECT_EQ(formatWrites, 2) << "the init is attempted exactly twice, never more";
+
+    const auto isFormat = [](const FirefaceScriptBus::Write& w) { return w.hi == 2U && w.lo == 0x20U; };
+    const auto firstFormat = std::find_if(bus.writes.begin(), bus.writes.end(), isFormat);
+    ASSERT_NE(firstFormat, bus.writes.end());
+    const auto secondFormat = std::find_if(firstFormat + 1, bus.writes.end(), isFormat);
+    ASSERT_NE(secondFormat, bus.writes.end());
+    const auto reset = std::find_if(firstFormat + 1, secondFormat,
+        [](const FirefaceScriptBus::Write& w) { return w.hi == 2U && w.lo == 0x34U; });
+    ASSERT_NE(reset, secondFormat) << "the retry must clear the device's stream state first";
+    EXPECT_EQ(reset->bytes, std::vector<uint8_t>(12U, 0));  // three zero quadlets
 }
 
 TEST(FirefaceSequenceTests, FF400RejectsOutOfRangeChannelBeforeAnyStreamingWrites) {
@@ -697,9 +849,13 @@ TEST(FirefaceSequenceTests, FF800CapturePollTimesOutAtBoundAndHonorsCancellation
     const uint64_t elapsed = ASFW::Audio::Session::UptimeMilliseconds() - before;
     EXPECT_FALSE(assignment);
     EXPECT_EQ(assignment.error(), kIOReturnTimeout);
-    EXPECT_GE(elapsed, 490U);
-    // Sanitized CI can add scheduling overhead to the 500 ms polling deadline.
-    EXPECT_LT(elapsed, 750U);
+    // Two bounded attempts, because a card that publishes nothing gets its stream
+    // state reset and one more full init (see
+    // FF800ResetsTheDeviceStreamStateAndRetriesWhenNoChannelAppears): a 100 ms
+    // frequency settle plus a 500 ms channel deadline each. Sanitized CI can add
+    // scheduling overhead on top of both deadlines.
+    EXPECT_GE(elapsed, 990U);
+    EXPECT_LT(elapsed, 1500U);
     EXPECT_EQ(family.Stop(), kIOReturnSuccess);
     ExpectStopThenMute(bus, 0x34U, 28U); // assignment timeout resets the partially configured device
 
@@ -738,7 +894,7 @@ TEST(FirefaceSequenceTests, NewRouteGenerationDiscardsOldInitStateAndReinitializ
     ASFW::Audio::AudioDuplexChannels channels{};
     ASSERT_TRUE(family.Configure(channels, {.sampleRateHz = 48000}));
     ASSERT_TRUE(family.AssignChannels(channels));
-    ASSERT_EQ(bus.writes.size(), 1U);
+    ASSERT_EQ(bus.writes.size(), 2U); // frequency, then the packet format
 
     route.registry.InvalidateLiveMappingsForBusReset();
     ::ASFW::Discovery::ConfigROM rom{};
@@ -753,8 +909,10 @@ TEST(FirefaceSequenceTests, NewRouteGenerationDiscardsOldInitStateAndReinitializ
     ASSERT_TRUE(family.Configure(channels, {.sampleRateHz = 48000}));
     auto assigned = family.AssignChannels(channels);
     ASSERT_TRUE(assigned);
-    ASSERT_EQ(bus.writes.size(), 2U);
-    EXPECT_EQ(bus.writes[1].lo, 0x1cU);
+    ASSERT_EQ(bus.writes.size(), 4U);
+    EXPECT_EQ(bus.writes[2].lo, 0x1cU);
+    EXPECT_EQ(bus.writes[2].bytes, bus.writes[0].bytes); // the frequency goes first again
+    EXPECT_EQ(bus.writes[3].lo, 0x20U);
 }
 
 TEST(FirefaceSequenceTests, FailedFetchInitStartAndStopWritesHaveSafeRollbackBoundaries) {
